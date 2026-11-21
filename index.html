@@ -1,12 +1,77 @@
-<!DOCTYPE html>
+<!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Hello</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrisperWhisper Transcriber</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <button id="update" class="primary" hidden>Update available — restart to install</button>
 
-<h1>Hello world</h1>
-<button id="update" hidden>Update available — restart to install</button>
+  <!-- Model loading: one-time download, cached by the browser afterwards -->
+  <section id="loading" class="card">
+    <h2 id="load-title">Loading the speech recognition model…</h2>
+    <p class="note">This is a <strong>one-time download</strong> of about 1.75 GB. Your browser keeps it, so later visits start in a few seconds.</p>
+    <div id="progress-list"></div>
+    <p id="load-error" class="error" hidden></p>
+  </section>
 
+  <!-- Drop area, shown once the model is ready -->
+  <section id="input" class="card" hidden>
+    <div class="row">
+      <label for="language">Language</label>
+      <select id="language"></select>
+    </div>
+    <label id="drop" class="drop">
+      <input id="file" type="file" accept="audio/*" multiple>
+      <span class="icon" aria-hidden="true">⬆</span>
+      <span>Drag &amp; drop audio files here, or click to select</span>
+      <span class="hint">One file per speaker: each file becomes a tier, named after the file</span>
+      <span class="hint">.wav, .mp3, .ogg, .m4a</span>
+    </label>
+    <div id="tprogress" class="progress" hidden>
+      <div class="label"><span id="tprogress-text"></span><span id="tprogress-eta"></span></div>
+      <div class="bar"><div id="tprogress-bar"></div></div>
+    </div>
+    <p id="status" class="status"></p>
+  </section>
+
+  <!-- Transcription table -->
+  <section id="output" class="card" hidden>
+    <div class="row between">
+      <h2>Transcription</h2>
+      <div class="buttons">
+        <button id="eaf" class="primary">Download .eaf</button>
+        <button id="copy" title="Copy as tab-separated start, end, text (seconds)">Copy</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th id="tier-col" hidden>Tier</th><th>Start</th><th>End</th><th>Text</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    Runs entirely in your browser; audio never leaves your computer.
+    Model: <a href="https://huggingface.co/nyralabs/CrisperWhisper2.0_turbo">CrisperWhisper 2.0 turbo</a>
+    (ONNX export <a href="https://huggingface.co/Masterx/CrisperWhisper2.0-turbo-ONNX">Masterx/CrisperWhisper2.0-turbo-ONNX</a>),
+    licensed for <strong>non-commercial research use only</strong>, including the transcripts it produces
+    (<a href="https://huggingface.co/nyralabs/CrisperWhisper2.0_turbo/blob/main/LICENSE.md">license</a>).
+    Utterance times are trimmed with <a href="https://github.com/snakers4/silero-vad">Silero VAD</a> v5.1.2 (MIT).
+  </footer>
+</main>
+<!-- onnxruntime-web for Silero VAD (same pinned version as the vad-check app) -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+<script type="module" src="app.js"></script>
+<!-- Electron auto-update: a plain script, so it works while app.js is still loading the model -->
 <script>
-  const button = document.getElementById('update')
-  window.updater.onDownloaded(() => button.hidden = false)
-  button.onclick = () => window.updater.install()
+  const updateButton = document.getElementById('update')
+  window.updater.onDownloaded(() => updateButton.hidden = false)
+  updateButton.onclick = () => window.updater.install()
 </script>
+</body>
+</html>

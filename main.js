@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
+const { app, BrowserWindow, ipcMain, shell } = require('electron')
 const { autoUpdater } = require('electron-updater')
 const path = require('node:path')
 
@@ -7,6 +7,12 @@ app.whenReady().then(() => {
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
   })
   win.loadFile('index.html')
+
+  // Links in the page (e.g. the model licence) open in the user's browser, not in this window
+  win.webContents.on('will-navigate', (event, url) => {
+    event.preventDefault()
+    if (url.startsWith('https://')) shell.openExternal(url)
+  })
 
   autoUpdater.on('update-downloaded', () => win.webContents.send('update-downloaded'))
   autoUpdater.checkForUpdates()
