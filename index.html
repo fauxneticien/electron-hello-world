@@ -1,12 +1,555 @@
 <!DOCTYPE html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Hello</title>
+<title>VAD Audio Check</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 720px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    color: #1a1a1a;
+  }
+  h2 { margin-bottom: 0.25rem; }
+  p.lead { color: #555; margin-top: 0; }
+  #drop {
+    display: block;
+    border: 2px dashed #999;
+    border-radius: 10px;
+    padding: 3rem 1rem;
+    text-align: center;
+    color: #666;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  #drop.dragover {
+    border-color: #2563eb;
+    background: #eff6ff;
+    color: #2563eb;
+  }
+  #drop input { display: none; }
+  #status {
+    margin-top: 0.75rem;
+    color: #666;
+    font-size: 0.9rem;
+    min-height: 1.2em;
+  }
+  #progress {
+    width: 100%;
+    height: 0.6rem;
+    margin-top: 0.5rem;
+    appearance: none;
+    border: none;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  #progress::-webkit-progress-bar { background: #eee; border-radius: 4px; }
+  #progress::-webkit-progress-value { background: #2563eb; border-radius: 4px; transition: width 0.1s; }
+  #progress::-moz-progress-bar { background: #2563eb; border-radius: 4px; }
+  #output {
+    margin-top: 1rem;
+    background: #f6f6f6;
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    padding: 1rem;
+    min-height: 200px;
+    max-height: 50vh;
+    overflow-y: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.9rem;
+    white-space: pre-wrap;
+    line-height: 1.5;
+  }
+  #output:empty::before { content: "Results will appear here."; color: #aaa; }
+  .line-ok       { color: #15803d; }
+  .line-nospeech { color: #b91c1c; font-weight: 600; }
+  .line-error    { color: #b91c1c; }
+  .line-info     { color: #777; }
+</style>
+</head>
+<body>
+  <button id="update" hidden>Update available — restart to install</button>
+  <h2>VAD Audio Check</h2>
+  <p class="lead">
+    Drop one or more <code>.wav</code> files to verify each contains detected speech.
+    Long files are checked up to the first 10 minutes only.
+  </p>
 
-<h1>Hello world</h1>
-<button id="update" hidden>Update available — restart to install</button>
+  <label id="drop">
+    <input type="file" multiple accept=".wav,audio/wav,audio/wave,audio/x-wav" id="file-input">
+    <div>Drop .wav files here, or click to choose</div>
+  </label>
+  <div id="status">Loading VAD model…</div>
+  <progress id="progress" value="0" max="100"></progress>
+  <div id="output"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
 <script>
-  const button = document.getElementById('update')
-  window.updater.onDownloaded(() => button.hidden = false)
-  button.onclick = () => window.updater.install()
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+ort.env.wasm.numThreads = 1;
+
+const MODEL_URL        = 'https://cdn.jsdelivr.net/gh/snakers4/silero-vad@master/src/silero_vad/data/silero_vad.onnx';
+const MAX_DURATION_SEC = 10 * 60;     // hard cap per file
+const FRAMES_PER_READ  = 1 << 20;     // ~1M source frames per slice() call
+
+// =============================================================================
+// SileroVAD — JS port of silero_vad.py. Hysteresis split into a static method
+// so the streaming pipeline can feed it probs collected chunk-by-chunk.
+// =============================================================================
+class SileroVAD {
+  constructor(session) {
+    this.session = session;
+    this.samplingRate     = 16000;
+    this.batchSize        = 1;
+    this.contextSize      = 64;
+    this.windowSizeSamples = 512;
+    this.resetStates();
+  }
+
+  static async create(modelUrl) {
+    const session = await ort.InferenceSession.create(modelUrl, {
+      executionProviders: ['wasm'],
+    });
+    return new SileroVAD(session);
+  }
+
+  resetStates() {
+    this._state   = new Float32Array(2 * this.batchSize * 128);
+    this._context = null;
+  }
+
+  async forward(chunk) {
+    if (!this._context) this._context = new Float32Array(this.contextSize);
+
+    const input = new Float32Array(this.contextSize + this.windowSizeSamples);
+    input.set(this._context, 0);
+    input.set(chunk, this.contextSize);
+
+    const outputs = await this.session.run({
+      input: new ort.Tensor('float32', input, [this.batchSize, this.contextSize + this.windowSizeSamples]),
+      state: new ort.Tensor('float32', this._state, [2, this.batchSize, 128]),
+      sr:    new ort.Tensor('int64',   BigInt64Array.from([16000n]), []),
+    });
+
+    this._state   = outputs.stateN.data;
+    this._context = chunk.slice(chunk.length - this.contextSize);
+    return outputs.output.data[0];
+  }
+
+  static computeSegments(speechProbs, audioLengthSamples, options = {}) {
+    const {
+      threshold              = 0.5,
+      minSpeechDurationMs    = 250,
+      maxSpeechDurationS     = Infinity,
+      minSilenceDurationMs   = 100,
+      speechPadMs            = 30,
+    } = options;
+
+    const sr  = 16000;
+    const wss = 512;
+    const minSpeechSamples            = sr * minSpeechDurationMs / 1000;
+    const speechPadSamples            = sr * speechPadMs / 1000;
+    const maxSpeechSamples            = sr * maxSpeechDurationS - wss - 2 * speechPadSamples;
+    const minSilenceSamples           = sr * minSilenceDurationMs / 1000;
+    const minSilenceSamplesAtMaxSpeech = sr * 98 / 1000;
+    const negThreshold                = Math.max(threshold - 0.15, 0.01);
+
+    let triggered = false;
+    let currentSpeech = {};
+    const speeches = [];
+    let tempEnd = 0, prevEnd = 0, nextStart = 0;
+
+    for (let i = 0; i < speechProbs.length; i++) {
+      const prob = speechProbs[i];
+
+      if (prob >= threshold && tempEnd) {
+        tempEnd = 0;
+        if (nextStart < prevEnd) nextStart = wss * i;
+      }
+      if (prob >= threshold && !triggered) {
+        triggered = true;
+        currentSpeech.start = wss * i;
+        continue;
+      }
+      if (triggered && (wss * i) - currentSpeech.start > maxSpeechSamples) {
+        if (prevEnd) {
+          currentSpeech.end = prevEnd;
+          speeches.push(currentSpeech);
+          currentSpeech = {};
+          if (nextStart < prevEnd) triggered = false;
+          else                     currentSpeech.start = nextStart;
+          prevEnd = nextStart = tempEnd = 0;
+        } else {
+          currentSpeech.end = wss * i;
+          speeches.push(currentSpeech);
+          currentSpeech = {};
+          prevEnd = nextStart = tempEnd = 0;
+          triggered = false;
+          continue;
+        }
+      }
+      if (prob < negThreshold && triggered) {
+        if (!tempEnd) tempEnd = wss * i;
+        if ((wss * i) - tempEnd > minSilenceSamplesAtMaxSpeech) prevEnd = tempEnd;
+        if ((wss * i) - tempEnd < minSilenceSamples) {
+          continue;
+        } else {
+          currentSpeech.end = tempEnd;
+          if ((currentSpeech.end - currentSpeech.start) > minSpeechSamples) {
+            speeches.push(currentSpeech);
+          }
+          currentSpeech = {};
+          prevEnd = nextStart = tempEnd = 0;
+          triggered = false;
+          continue;
+        }
+      }
+    }
+
+    if (currentSpeech.start !== undefined &&
+        (audioLengthSamples - currentSpeech.start) > minSpeechSamples) {
+      currentSpeech.end = audioLengthSamples;
+      speeches.push(currentSpeech);
+    }
+    return speeches;
+  }
+}
+
+// =============================================================================
+// WAV header parser — reads the first 64 KB and walks RIFF chunks to find
+// `fmt ` and `data`. Tolerant of extra chunks (bext, LIST, JUNK, etc.).
+// =============================================================================
+async function parseWavHeader(file) {
+  const headSize = Math.min(65536, file.size);
+  const headerBytes = new Uint8Array(await file.slice(0, headSize).arrayBuffer());
+  const dv = new DataView(headerBytes.buffer);
+  const tag = (off) => String.fromCharCode(
+    headerBytes[off], headerBytes[off + 1], headerBytes[off + 2], headerBytes[off + 3]
+  );
+
+  if (tag(0) !== 'RIFF' || tag(8) !== 'WAVE') {
+    throw new Error('Not a WAV file (missing RIFF/WAVE markers)');
+  }
+
+  let fmt = null;
+  let dataOffset = null;
+  let dataSize = null;
+  let offset = 12;
+
+  while (offset + 8 <= headerBytes.length) {
+    const id = tag(offset);
+    const size = dv.getUint32(offset + 4, true);
+
+    if (id === 'fmt ') {
+      fmt = {
+        audioFormat:   dv.getUint16(offset + 8,  true),
+        numChannels:   dv.getUint16(offset + 10, true),
+        sampleRate:    dv.getUint32(offset + 12, true),
+        bitsPerSample: dv.getUint16(offset + 22, true),
+      };
+    } else if (id === 'data') {
+      dataOffset = offset + 8;
+      dataSize   = size;
+      break;
+    }
+    offset += 8 + size + (size & 1);   // chunks are padded to even byte alignment
+  }
+
+  if (!fmt) throw new Error('No fmt chunk found in WAV header');
+  if (dataOffset === null) throw new Error('No data chunk found in first 64 KB');
+
+  return { ...fmt, dataOffset, dataSize };
+}
+
+// =============================================================================
+// PCM bytes -> mono Float32. Returns a function specialized for the file's
+// format so we don't re-branch in the inner loop.
+// =============================================================================
+function makePcmToMonoFloat32(header) {
+  const { audioFormat, numChannels, bitsPerSample } = header;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockSize = bytesPerSample * numChannels;
+
+  if (audioFormat === 3 && bitsPerSample === 32) {        // 32-bit float
+    return (bytes) => {
+      const numFrames = Math.floor(bytes.byteLength / blockSize);
+      const out = new Float32Array(numFrames);
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let i = 0; i < numFrames; i++) {
+        let sum = 0;
+        for (let c = 0; c < numChannels; c++) {
+          sum += dv.getFloat32(i * blockSize + c * 4, true);
+        }
+        out[i] = sum / numChannels;
+      }
+      return out;
+    };
+  }
+  if (audioFormat === 1 && bitsPerSample === 16) {        // 16-bit PCM
+    return (bytes) => {
+      const numFrames = Math.floor(bytes.byteLength / blockSize);
+      const out = new Float32Array(numFrames);
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let i = 0; i < numFrames; i++) {
+        let sum = 0;
+        for (let c = 0; c < numChannels; c++) {
+          sum += dv.getInt16(i * blockSize + c * 2, true);
+        }
+        out[i] = (sum / numChannels) / 32768;
+      }
+      return out;
+    };
+  }
+  if (audioFormat === 1 && bitsPerSample === 24) {        // 24-bit PCM (typical Logic export)
+    return (bytes) => {
+      const numFrames = Math.floor(bytes.byteLength / blockSize);
+      const out = new Float32Array(numFrames);
+      const u8 = bytes;
+      for (let i = 0; i < numFrames; i++) {
+        let sum = 0;
+        for (let c = 0; c < numChannels; c++) {
+          const p = i * blockSize + c * 3;
+          // Read 3 bytes little-endian, sign-extend 24-bit -> 32-bit
+          let v = (u8[p + 2] << 16) | (u8[p + 1] << 8) | u8[p];
+          v = (v << 8) >> 8;
+          sum += v;
+        }
+        out[i] = (sum / numChannels) / 8388608;
+      }
+      return out;
+    };
+  }
+  if (audioFormat === 1 && bitsPerSample === 32) {        // 32-bit PCM int
+    return (bytes) => {
+      const numFrames = Math.floor(bytes.byteLength / blockSize);
+      const out = new Float32Array(numFrames);
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let i = 0; i < numFrames; i++) {
+        let sum = 0;
+        for (let c = 0; c < numChannels; c++) {
+          sum += dv.getInt32(i * blockSize + c * 4, true);
+        }
+        out[i] = (sum / numChannels) / 2147483648;
+      }
+      return out;
+    };
+  }
+  throw new Error(`Unsupported WAV format: audioFormat=${audioFormat}, bitsPerSample=${bitsPerSample}`);
+}
+
+// =============================================================================
+// Streaming downsampler to 16 kHz. Carries state across chunks.
+//   - integer ratios (e.g. 192k/16k = 12): box-filter average -> light anti-alias
+//   - non-integer (e.g. 44.1k/16k):       nearest-neighbor with fractional carry
+// VAD doesn't need pristine fidelity — these are "good enough" downsamplers.
+// =============================================================================
+class Downsampler {
+  constructor(inputRate, outputRate = 16000) {
+    this.ratio = inputRate / outputRate;
+    if (Number.isInteger(this.ratio)) {
+      this.mode = 'box';
+      this.N = this.ratio;
+      this.accum = 0;
+      this.count = 0;
+    } else {
+      this.mode = 'nearest';
+      this.fracPos = 0;
+    }
+  }
+
+  process(samples) {
+    if (this.mode === 'box') {
+      const N = this.N;
+      const outLen = Math.floor((samples.length + this.count) / N);
+      const out = new Float32Array(outLen);
+      let outIdx = 0;
+      for (let i = 0; i < samples.length; i++) {
+        this.accum += samples[i];
+        this.count++;
+        if (this.count === N) {
+          out[outIdx++] = this.accum / N;
+          this.accum = 0;
+          this.count = 0;
+        }
+      }
+      return out;
+    } else {
+      const out = [];
+      while (this.fracPos < samples.length) {
+        out.push(samples[Math.floor(this.fracPos)]);
+        this.fracPos += this.ratio;
+      }
+      this.fracPos -= samples.length;
+      return Float32Array.from(out);
+    }
+  }
+}
+
+// =============================================================================
+// streamAndCheck — the main pipeline. Reads the WAV chunk-by-chunk, downsamples
+// on the fly, packs into 512-sample windows, runs Silero, stops at 10 min.
+// =============================================================================
+async function streamAndCheck(file, silero, onProgress) {
+  const header = await parseWavHeader(file);
+  const { sampleRate, numChannels, bitsPerSample, audioFormat, dataOffset, dataSize } = header;
+
+  const bytesPerFrame = (bitsPerSample / 8) * numChannels;
+  const totalFrames = Math.floor(
+    Math.min(dataSize || Infinity, file.size - dataOffset) / bytesPerFrame
+  );
+  const maxFrames = Math.floor(MAX_DURATION_SEC * sampleRate);
+  const framesToProcess = Math.min(totalFrames, maxFrames);
+  const truncated = totalFrames > maxFrames;
+
+  const pcmToMono   = makePcmToMonoFloat32(header);
+  const downsampler = new Downsampler(sampleRate, 16000);
+
+  silero.resetStates();
+  const speechProbs = [];
+  const window = new Float32Array(silero.windowSizeSamples);
+  let windowFill = 0;
+
+  let framesRead = 0;
+  while (framesRead < framesToProcess) {
+    const framesThisRead = Math.min(FRAMES_PER_READ, framesToProcess - framesRead);
+    const startByte = dataOffset + framesRead * bytesPerFrame;
+    const endByte   = startByte + framesThisRead * bytesPerFrame;
+
+    const bytes = new Uint8Array(await file.slice(startByte, endByte).arrayBuffer());
+    const monoSamples = pcmToMono(bytes);
+    const ds = downsampler.process(monoSamples);
+
+    // Pack downsampled samples into 512-window units, calling forward() each time
+    let dsIdx = 0;
+    while (dsIdx < ds.length) {
+      const need = silero.windowSizeSamples - windowFill;
+      const take = Math.min(need, ds.length - dsIdx);
+      window.set(ds.subarray(dsIdx, dsIdx + take), windowFill);
+      windowFill += take;
+      dsIdx += take;
+      if (windowFill === silero.windowSizeSamples) {
+        speechProbs.push(await silero.forward(window));
+        windowFill = 0;
+      }
+    }
+
+    framesRead += framesThisRead;
+    if (onProgress) onProgress(framesRead / framesToProcess);
+    await new Promise(r => setTimeout(r, 0));   // yield to UI
+  }
+  silero.resetStates();
+
+  const audioLength16k = speechProbs.length * silero.windowSizeSamples;
+  const segments = SileroVAD.computeSegments(speechProbs, audioLength16k);
+  return { hasSpeech: segments.length > 0, truncated };
+}
+
+// =============================================================================
+// UI glue
+// =============================================================================
+const dropEl     = document.getElementById('drop');
+const inputEl    = document.getElementById('file-input');
+const statusEl   = document.getElementById('status');
+const progressEl = document.getElementById('progress');
+const outputEl   = document.getElementById('output');
+
+function appendLine(text, cls = '') {
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = text;
+  outputEl.appendChild(div);
+  outputEl.scrollTop = outputEl.scrollHeight;
+}
+
+let silero = null;
+
+(async function init() {
+  try {
+    statusEl.textContent = 'Loading Silero VAD model…';
+    silero = await SileroVAD.create(MODEL_URL);
+    statusEl.textContent = 'VAD model loaded. Ready.';
+  } catch (e) {
+    statusEl.textContent = 'Failed to load VAD model: ' + e.message;
+    console.error(e);
+  }
+})();
+
+async function checkFile(file, onChunkProgress) {
+  try {
+    const { hasSpeech, truncated } = await streamAndCheck(file, silero, onChunkProgress);
+    const suffix = truncated ? '  (first 10 min)' : '';
+    if (hasSpeech) appendLine(`OK: ${file.name}${suffix}`, 'line-ok');
+    else           appendLine(`NO SPEECH DETECTED: ${file.name}${suffix}`, 'line-nospeech');
+  } catch (e) {
+    appendLine(`ERROR (${file.name}): ${e.message}`, 'line-error');
+  }
+}
+
+let busy = false;
+
+async function processFiles(fileList) {
+  if (!silero) {
+    appendLine('VAD model not ready yet — please wait.', 'line-error');
+    return;
+  }
+  if (busy) {
+    appendLine('Still processing the previous batch…', 'line-info');
+    return;
+  }
+  const wavs = [...fileList].filter(f => /\.wav$/i.test(f.name));
+  if (!wavs.length) {
+    appendLine('No .wav files in selection.', 'line-info');
+    return;
+  }
+
+  busy = true;
+  progressEl.value = 0;
+  appendLine(`--- Checking ${wavs.length} file(s) ---`, 'line-info');
+
+  for (let i = 0; i < wavs.length; i++) {
+    statusEl.textContent = `Processing ${i + 1} / ${wavs.length}: ${wavs[i].name}`;
+    await checkFile(wavs[i], (chunkFraction) => {
+      progressEl.value = ((i + chunkFraction) / wavs.length) * 100;
+    });
+    progressEl.value = ((i + 1) / wavs.length) * 100;
+  }
+
+  appendLine('--- Done ---', 'line-info');
+  appendLine('', 'line-info');
+  statusEl.textContent = 'Ready.';
+  busy = false;
+}
+
+// Drag-and-drop wiring
+['dragenter', 'dragover'].forEach(evt =>
+  dropEl.addEventListener(evt, e => {
+    e.preventDefault();
+    dropEl.classList.add('dragover');
+  })
+);
+['dragleave', 'drop'].forEach(evt =>
+  dropEl.addEventListener(evt, e => {
+    e.preventDefault();
+    if (evt === 'dragleave' && dropEl.contains(e.relatedTarget)) return;
+    dropEl.classList.remove('dragover');
+  })
+);
+dropEl.addEventListener('drop', e => {
+  if (e.dataTransfer && e.dataTransfer.files) processFiles(e.dataTransfer.files);
+});
+inputEl.addEventListener('change', e => {
+  processFiles(e.target.files);
+  e.target.value = '';
+});
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop',     e => e.preventDefault());
 </script>
+<script>
+  const updateButton = document.getElementById('update')
+  window.updater.onDownloaded(() => updateButton.hidden = false)
+  updateButton.onclick = () => window.updater.install()
+</script>
+</body>
+</html>
