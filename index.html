@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Hello</title>
+
+<h1>Hello</h1>
+<button id="update" hidden>Update available — restart to install</button>
+
+<script>
+  const button = document.getElementById('update')
+  window.updater.onDownloaded(() => button.hidden = false)
+  button.onclick = () => window.updater.install()
+</script>

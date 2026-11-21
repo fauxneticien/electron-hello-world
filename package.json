@@ -1,0 +1,29 @@
+{
+  "name": "electron-hello-world",
+  "version": "0.0.1",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.fauxneticien.electron-hello-world",
+    "productName": "Hello",
+    "mac": {
+      "target": ["dmg", "zip"]
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "fauxneticien",
+      "repo": "electron-hello-world",
+      "releaseType": "release"
+    }
+  }
+}
